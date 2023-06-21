@@ -1,6 +1,3 @@
-let Module = {};
-let opencvWasmBinaryFile = './opencv.wasm';
-
 (function(root, factory) {
     if (typeof define === 'function' && define.amd) {
         // AMD. Register as an anonymous module.
@@ -63,10 +60,6 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         scriptDirectory = __dirname + "/"
                     }
                     read_ = (filename, binary) => {
-                        var ret = tryParseAsDataURI(filename);
-                        if (ret) {
-                            return binary ? ret : ret.toString()
-                        }
                         filename = isFileURI(filename) ? new URL(filename) : nodePath.normalize(filename);
                         return fs.readFileSync(filename, binary ? undefined : "utf8")
                     };
@@ -78,10 +71,6 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         return ret
                     };
                     readAsync = (filename, onload, onerror, binary = true) => {
-                        var ret = tryParseAsDataURI(filename);
-                        if (ret) {
-                            onload(ret)
-                        }
                         filename = isFileURI(filename) ? new URL(filename) : nodePath.normalize(filename);
                         fs.readFile(filename, binary ? undefined : "utf8", (err, data) => {
                             if (err) onerror(err);
@@ -112,34 +101,18 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         scriptDirectory = ""
                     } {
                         read_ = url => {
-                            try {
-                                var xhr = new XMLHttpRequest;
-                                xhr.open("GET", url, false);
-                                xhr.send(null);
-                                return xhr.responseText
-                            } catch (err) {
-                                var data = tryParseAsDataURI(url);
-                                if (data) {
-                                    return intArrayToString(data)
-                                }
-                                throw err
-                            }
+                            var xhr = new XMLHttpRequest;
+                            xhr.open("GET", url, false);
+                            xhr.send(null);
+                            return xhr.responseText
                         };
                         if (ENVIRONMENT_IS_WORKER) {
                             readBinary = url => {
-                                try {
-                                    var xhr = new XMLHttpRequest;
-                                    xhr.open("GET", url, false);
-                                    xhr.responseType = "arraybuffer";
-                                    xhr.send(null);
-                                    return new Uint8Array(xhr.response)
-                                } catch (err) {
-                                    var data = tryParseAsDataURI(url);
-                                    if (data) {
-                                        return data
-                                    }
-                                    throw err
-                                }
+                                var xhr = new XMLHttpRequest;
+                                xhr.open("GET", url, false);
+                                xhr.responseType = "arraybuffer";
+                                xhr.send(null);
+                                return new Uint8Array(xhr.response)
                             }
                         }
                         readAsync = (url, onload, onerror) => {
@@ -149,11 +122,6 @@ let opencvWasmBinaryFile = './opencv.wasm';
                             xhr.onload = () => {
                                 if (xhr.status == 200 || xhr.status == 0 && xhr.response) {
                                     onload(xhr.response);
-                                    return
-                                }
-                                var data = tryParseAsDataURI(url);
-                                if (data) {
-                                    onload(data.buffer);
                                     return
                                 }
                                 onerror()
@@ -304,32 +272,74 @@ let opencvWasmBinaryFile = './opencv.wasm';
                 function isFileURI(filename) {
                     return filename.startsWith("file://")
                 }
-                var wasmBinaryFile = opencvWasmBinaryFile;
+                var wasmBinaryFile;
+                wasmBinaryFile = "opencv_js.wasm";
                 if (!isDataURI(wasmBinaryFile)) {
                     wasmBinaryFile = locateFile(wasmBinaryFile)
                 }
 
                 function getBinary(file) {
-                    return cocoa_load_wasm_binary_hook();
+                    try {
+                        if (file == wasmBinaryFile && wasmBinary) {
+                            return new Uint8Array(wasmBinary)
+                        }
+                        if (readBinary) {
+                            return readBinary(file)
+                        }
+                        throw "both async and sync fetching of the wasm failed"
+                    } catch (err) {
+                        abort(err)
+                    }
                 }
 
-                function instantiateSync(file, info) {
-                    var instance;
-                    var module;
-                    var binary;
-                    try {
-                        binary = getBinary(file);
-                        module = new WebAssembly.Module(binary);
-                        instance = new WebAssembly.Instance(module, info)
-                    } catch (e) {
-                        var str = e.toString();
-                        err("failed to compile wasm module: " + str);
-                        if (str.includes("imported Memory") || str.includes("memory import")) {
-                            err("Memory size incompatibility issues may be due to changing INITIAL_MEMORY at runtime to something too large. Use ALLOW_MEMORY_GROWTH to allow any size memory (and also make sure not to set INITIAL_MEMORY at runtime to something smaller than it was at compile time).")
+                function getBinaryPromise(binaryFile) {
+                    if (!wasmBinary && (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER)) {
+                        if (typeof fetch == "function" && !isFileURI(binaryFile)) {
+                            return fetch(binaryFile, {
+                                credentials: "same-origin"
+                            }).then(response => {
+                                if (!response["ok"]) {
+                                    throw "failed to load wasm binary file at '" + binaryFile + "'"
+                                }
+                                return response["arrayBuffer"]()
+                            }).catch(() => getBinary(binaryFile))
+                        } else {
+                            if (readAsync) {
+                                return new Promise((resolve, reject) => {
+                                    readAsync(binaryFile, response => resolve(new Uint8Array(response)), reject)
+                                })
+                            }
                         }
-                        throw e
                     }
-                    return [instance, module]
+                    return Promise.resolve().then(() => getBinary(binaryFile))
+                }
+
+                function instantiateArrayBuffer(binaryFile, imports, receiver) {
+                    return getBinaryPromise(binaryFile).then(binary => {
+                        return WebAssembly.instantiate(binary, imports)
+                    }).then(instance => {
+                        return instance
+                    }).then(receiver, reason => {
+                        err("failed to asynchronously prepare wasm: " + reason);
+                        abort(reason)
+                    })
+                }
+
+                function instantiateAsync(binary, binaryFile, imports, callback) {
+                    if (!binary && typeof WebAssembly.instantiateStreaming == "function" && !isDataURI(binaryFile) && !isFileURI(binaryFile) && !ENVIRONMENT_IS_NODE && typeof fetch == "function") {
+                        return fetch(binaryFile, {
+                            credentials: "same-origin"
+                        }).then(response => {
+                            var result = WebAssembly.instantiateStreaming(response, imports);
+                            return result.then(callback, function(reason) {
+                                err("wasm streaming compile failed: " + reason);
+                                err("falling back to ArrayBuffer instantiation");
+                                return instantiateArrayBuffer(binaryFile, imports, callback)
+                            })
+                        })
+                    } else {
+                        return instantiateArrayBuffer(binaryFile, imports, callback)
+                    }
                 }
 
                 function createWasm() {
@@ -348,6 +358,10 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         return exports
                     }
                     addRunDependency("wasm-instantiate");
+
+                    function receiveInstantiationResult(result) {
+                        receiveInstance(result["instance"])
+                    }
                     if (Module["instantiateWasm"]) {
                         try {
                             return Module["instantiateWasm"](info, receiveInstance)
@@ -356,8 +370,8 @@ let opencvWasmBinaryFile = './opencv.wasm';
                             readyPromiseReject(e)
                         }
                     }
-                    var result = instantiateSync(wasmBinaryFile, info);
-                    return receiveInstance(result[0])
+                    instantiateAsync(wasmBinary, wasmBinaryFile, info, receiveInstantiationResult).catch(readyPromiseReject);
+                    return {}
                 }
                 var tempDouble;
                 var tempI64;
@@ -413,11 +427,9 @@ let opencvWasmBinaryFile = './opencv.wasm';
                 }
                 var _emscripten_get_now;
                 if (ENVIRONMENT_IS_NODE) {
-                    _emscripten_get_now = () => {
-                        var t = process.hrtime();
-                        return t[0] * 1e3 + t[1] / 1e6
-                    }
-                } else _emscripten_get_now = () => performance.now();
+                    global.performance = require("perf_hooks").performance
+                }
+                _emscripten_get_now = () => performance.now();
 
                 function setMainLoop(browserIterationFunc, fps, simulateInfiniteLoop, arg, noSetTiming) {
                     assert(!Browser.mainLoop.func, "emscripten_set_main_loop: there can only be one main loop function at once: call emscripten_cancel_main_loop to cancel the previous one before setting a new one with different parameters.");
@@ -489,7 +501,7 @@ let opencvWasmBinaryFile = './opencv.wasm';
 
                 function ExitStatus(status) {
                     this.name = "ExitStatus";
-                    this.message = "Program terminated with exit(" + status + ")";
+                    this.message = `Program terminated with exit(${status})`;
                     this.status = status
                 }
                 var PATH = {
@@ -1478,8 +1490,8 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         return FS.nodePermissions(node, FS.flagsToPermissionString(flags))
                     },
                     MAX_OPEN_FDS: 4096,
-                    nextfd: (fd_start = 0, fd_end = FS.MAX_OPEN_FDS) => {
-                        for (var fd = fd_start; fd <= fd_end; fd++) {
+                    nextfd: () => {
+                        for (var fd = 0; fd <= FS.MAX_OPEN_FDS; fd++) {
                             if (!FS.streams[fd]) {
                                 return fd
                             }
@@ -1487,7 +1499,7 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         throw new FS.ErrnoError(33)
                     },
                     getStream: fd => FS.streams[fd],
-                    createStream: (stream, fd_start, fd_end) => {
+                    createStream: (stream, fd = -1) => {
                         if (!FS.FSStream) {
                             FS.FSStream = function() {
                                 this.shared = {}
@@ -1536,7 +1548,9 @@ let opencvWasmBinaryFile = './opencv.wasm';
                             })
                         }
                         stream = Object.assign(new FS.FSStream, stream);
-                        var fd = FS.nextfd(fd_start, fd_end);
+                        if (fd == -1) {
+                            fd = FS.nextfd()
+                        }
                         stream.fd = fd;
                         FS.streams[fd] = stream;
                         return stream
@@ -3305,18 +3319,6 @@ let opencvWasmBinaryFile = './opencv.wasm';
 
                 function stringToUTF8(str, outPtr, maxBytesToWrite) {
                     return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite)
-                }
-
-                function intArrayToString(array) {
-                    var ret = [];
-                    for (var i = 0; i < array.length; i++) {
-                        var chr = array[i];
-                        if (chr > 255) {
-                            chr &= 255
-                        }
-                        ret.push(String.fromCharCode(chr))
-                    }
-                    return ret.join("")
                 }
 
                 function ExceptionInfo(excPtr) {
@@ -5420,8 +5422,9 @@ let opencvWasmBinaryFile = './opencv.wasm';
 
                 function emscripten_realloc_buffer(size) {
                     var b = wasmMemory.buffer;
+                    var pages = size - b.byteLength + 65535 >>> 16;
                     try {
-                        wasmMemory.grow(size - b.byteLength + 65535 >>> 16);
+                        wasmMemory.grow(pages);
                         updateMemoryViews();
                         return 1
                     } catch (e) {}
@@ -5470,7 +5473,7 @@ let opencvWasmBinaryFile = './opencv.wasm';
                         }
                         var strings = [];
                         for (var x in env) {
-                            strings.push(x + "=" + env[x])
+                            strings.push(`${x}=${env[x]}`)
                         }
                         getEnvStrings.strings = strings
                     }
@@ -5957,55 +5960,6 @@ let opencvWasmBinaryFile = './opencv.wasm';
                 init_RegisteredPointer();
                 UnboundTypeError = Module["UnboundTypeError"] = extendError(Error, "UnboundTypeError");
                 init_emval();
-                var decodeBase64 = typeof atob == "function" ? atob : function(input) {
-                    var keyStr = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
-                    var output = "";
-                    var chr1, chr2, chr3;
-                    var enc1, enc2, enc3, enc4;
-                    var i = 0;
-                    input = input.replace(/[^A-Za-z0-9\+\/\=]/g, "");
-                    do {
-                        enc1 = keyStr.indexOf(input.charAt(i++));
-                        enc2 = keyStr.indexOf(input.charAt(i++));
-                        enc3 = keyStr.indexOf(input.charAt(i++));
-                        enc4 = keyStr.indexOf(input.charAt(i++));
-                        chr1 = enc1 << 2 | enc2 >> 4;
-                        chr2 = (enc2 & 15) << 4 | enc3 >> 2;
-                        chr3 = (enc3 & 3) << 6 | enc4;
-                        output = output + String.fromCharCode(chr1);
-                        if (enc3 !== 64) {
-                            output = output + String.fromCharCode(chr2)
-                        }
-                        if (enc4 !== 64) {
-                            output = output + String.fromCharCode(chr3)
-                        }
-                    } while (i < input.length);
-                    return output
-                };
-
-                function intArrayFromBase64(s) {
-                    if (typeof ENVIRONMENT_IS_NODE == "boolean" && ENVIRONMENT_IS_NODE) {
-                        var buf = Buffer.from(s, "base64");
-                        return new Uint8Array(buf["buffer"], buf["byteOffset"], buf["byteLength"])
-                    }
-                    try {
-                        var decoded = decodeBase64(s);
-                        var bytes = new Uint8Array(decoded.length);
-                        for (var i = 0; i < decoded.length; ++i) {
-                            bytes[i] = decoded.charCodeAt(i)
-                        }
-                        return bytes
-                    } catch (_) {
-                        throw new Error("Converting base64 string to bytes failed.")
-                    }
-                }
-
-                function tryParseAsDataURI(filename) {
-                    if (!isDataURI(filename)) {
-                        return
-                    }
-                    return intArrayFromBase64(filename.slice(dataURIPrefix.length))
-                }
                 var wasmImports = {
                     "e": ___cxa_throw,
                     "G": ___syscall_fcntl64,
@@ -6015,16 +5969,16 @@ let opencvWasmBinaryFile = './opencv.wasm';
                     "m": __embind_finalize_value_object,
                     "K": __embind_register_bigint,
                     "V": __embind_register_bool,
-                    "h": __embind_register_class,
-                    "w": __embind_register_class_class_function,
+                    "i": __embind_register_class,
+                    "s": __embind_register_class_class_function,
                     "d": __embind_register_class_constructor,
                     "c": __embind_register_class_function,
-                    "j": __embind_register_class_property,
+                    "f": __embind_register_class_property,
                     "a": __embind_register_constant,
                     "U": __embind_register_emval,
                     "I": __embind_register_float,
                     "b": __embind_register_function,
-                    "v": __embind_register_integer,
+                    "w": __embind_register_integer,
                     "l": __embind_register_memory_view,
                     "k": __embind_register_smart_ptr,
                     "H": __embind_register_std_string,
@@ -6032,20 +5986,20 @@ let opencvWasmBinaryFile = './opencv.wasm';
                     "Y": __embind_register_value_array,
                     "A": __embind_register_value_array_element,
                     "n": __embind_register_value_object,
-                    "g": __embind_register_value_object_field,
+                    "h": __embind_register_value_object_field,
                     "W": __embind_register_void,
                     "M": __emscripten_get_now_is_monotonic,
                     "q": __emval_as,
                     "o": __emval_call_void_method,
-                    "f": __emval_decref,
+                    "g": __emval_decref,
                     "p": __emval_get_method_caller,
                     "r": __emval_get_property,
-                    "t": __emval_incref,
+                    "u": __emval_incref,
                     "x": __emval_new_array,
-                    "u": __emval_new_cstring,
-                    "s": __emval_run_destructors,
+                    "v": __emval_new_cstring,
+                    "t": __emval_run_destructors,
                     "y": __emval_set_property,
-                    "i": __emval_take_value,
+                    "j": __emval_take_value,
                     "z": _abort,
                     "O": _emscripten_get_heap_max,
                     "P": _emscripten_get_now,
@@ -6060,24 +6014,60 @@ let opencvWasmBinaryFile = './opencv.wasm';
                     "L": _strftime_l
                 };
                 var asm = createWasm();
-                var ___wasm_call_ctors = asm["_"];
-                var _malloc = asm["$"];
-                var _free = asm["ba"];
-                var ___errno_location = asm["ca"];
-                var ___getTypeName = asm["da"];
-                var __embind_initialize_bindings = Module["__embind_initialize_bindings"] = asm["ea"];
-                var ___cxa_demangle = asm["__cxa_demangle"];
-                var ___cxa_is_pointer_type = asm["fa"];
-                var dynCall_ji = Module["dynCall_ji"] = asm["ga"];
-                var dynCall_viijii = Module["dynCall_viijii"] = asm["ha"];
-                var dynCall_jiii = Module["dynCall_jiii"] = asm["ia"];
-                var dynCall_vij = Module["dynCall_vij"] = asm["ja"];
-                var dynCall_jii = Module["dynCall_jii"] = asm["ka"];
-                var dynCall_viji = Module["dynCall_viji"] = asm["la"];
-                var dynCall_jiji = Module["dynCall_jiji"] = asm["ma"];
-                var dynCall_iiiiij = Module["dynCall_iiiiij"] = asm["na"];
-                var dynCall_iiiiijj = Module["dynCall_iiiiijj"] = asm["oa"];
-                var dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = asm["pa"];
+                var ___wasm_call_ctors = function() {
+                    return (___wasm_call_ctors = Module["asm"]["_"]).apply(null, arguments)
+                };
+                var _malloc = function() {
+                    return (_malloc = Module["asm"]["$"]).apply(null, arguments)
+                };
+                var _free = function() {
+                    return (_free = Module["asm"]["ba"]).apply(null, arguments)
+                };
+                var ___errno_location = function() {
+                    return (___errno_location = Module["asm"]["ca"]).apply(null, arguments)
+                };
+                var ___getTypeName = function() {
+                    return (___getTypeName = Module["asm"]["da"]).apply(null, arguments)
+                };
+                var __embind_initialize_bindings = Module["__embind_initialize_bindings"] = function() {
+                    return (__embind_initialize_bindings = Module["__embind_initialize_bindings"] = Module["asm"]["ea"]).apply(null, arguments)
+                };
+                var ___cxa_demangle = function() {
+                    return (___cxa_demangle = Module["asm"]["__cxa_demangle"]).apply(null, arguments)
+                };
+                var ___cxa_is_pointer_type = function() {
+                    return (___cxa_is_pointer_type = Module["asm"]["fa"]).apply(null, arguments)
+                };
+                var dynCall_ji = Module["dynCall_ji"] = function() {
+                    return (dynCall_ji = Module["dynCall_ji"] = Module["asm"]["ga"]).apply(null, arguments)
+                };
+                var dynCall_viijii = Module["dynCall_viijii"] = function() {
+                    return (dynCall_viijii = Module["dynCall_viijii"] = Module["asm"]["ha"]).apply(null, arguments)
+                };
+                var dynCall_jiii = Module["dynCall_jiii"] = function() {
+                    return (dynCall_jiii = Module["dynCall_jiii"] = Module["asm"]["ia"]).apply(null, arguments)
+                };
+                var dynCall_vij = Module["dynCall_vij"] = function() {
+                    return (dynCall_vij = Module["dynCall_vij"] = Module["asm"]["ja"]).apply(null, arguments)
+                };
+                var dynCall_jii = Module["dynCall_jii"] = function() {
+                    return (dynCall_jii = Module["dynCall_jii"] = Module["asm"]["ka"]).apply(null, arguments)
+                };
+                var dynCall_viji = Module["dynCall_viji"] = function() {
+                    return (dynCall_viji = Module["dynCall_viji"] = Module["asm"]["la"]).apply(null, arguments)
+                };
+                var dynCall_jiji = Module["dynCall_jiji"] = function() {
+                    return (dynCall_jiji = Module["dynCall_jiji"] = Module["asm"]["ma"]).apply(null, arguments)
+                };
+                var dynCall_iiiiij = Module["dynCall_iiiiij"] = function() {
+                    return (dynCall_iiiiij = Module["dynCall_iiiiij"] = Module["asm"]["na"]).apply(null, arguments)
+                };
+                var dynCall_iiiiijj = Module["dynCall_iiiiijj"] = function() {
+                    return (dynCall_iiiiijj = Module["dynCall_iiiiijj"] = Module["asm"]["oa"]).apply(null, arguments)
+                };
+                var dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = function() {
+                    return (dynCall_iiiiiijj = Module["dynCall_iiiiiijj"] = Module["asm"]["pa"]).apply(null, arguments)
+                };
                 Module["addRunDependency"] = addRunDependency;
                 Module["removeRunDependency"] = removeRunDependency;
                 Module["FS_createPath"] = FS.createPath;
@@ -6150,7 +6140,7 @@ let opencvWasmBinaryFile = './opencv.wasm';
                             willReadFrequently: true
                         });
                         ctx.drawImage(img, 0, 0, img.width, img.height)
-                    } else if (img instanceof HTMLCanvasElement) {
+                    } else if (img instanceof HTMLCanvasElement || img instanceof OffscreenCanvas) {
                         canvas = img;
                         ctx = canvas.getContext("2d")
                     } else {
@@ -6475,7 +6465,7 @@ let opencvWasmBinaryFile = './opencv.wasm';
                 };
 
 
-                return cv
+                return cv.ready
             }
 
         );
